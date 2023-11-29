@@ -55,3 +55,4 @@ Following environment variables can be used to configure the tool:
 ## Conan package
 
 This tool can be built as a conan package. It expects that the `cargo` conan dependency exists.
+An example cargo conan package can be found [here](https://github.com/microblink/cargo-conan-package).
