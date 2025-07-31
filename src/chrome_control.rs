@@ -1,10 +1,8 @@
-use futures_util::{stream::SplitSink, Future, SinkExt, StreamExt};
+use futures_util::{Future, SinkExt, StreamExt};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use crate::printer::print_blue;
+use crate::printer::{print_blue, print_red, print_yellow};
 
 pub type ChromeError = Box<dyn std::error::Error>;
 
@@ -72,9 +70,8 @@ pub async fn get_pages(port: u16) -> Result<Vec<PageInfo>, ChromeError> {
 pub struct ChromeUnderControl {
     port:          u16,
     proc_handle:   tokio::process::Child,
-    stream_sender: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-
-    websocket_id: u32,
+    stream_sender: tokio::sync::mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
+    id_counter:    IdCounter,
 }
 
 #[derive(Debug, Error)]
@@ -94,14 +91,8 @@ pub enum ChromeLaunchError {
     #[error("Invalid page count at launch. Expected 1, got {page_count}")]
     InvalidNumberOfPagesAtLaunch { page_count: usize },
 
-    #[error("Invalid start page url: {url}")]
-    InvalidStartPageUrl { url: String },
-
-    #[error("Error connecting to the debugger: {err}")]
-    ErrorConnectingToTheDebugger { err: tokio_tungstenite::tungstenite::Error },
-
-    #[error("Error installing rungime inspector: {err}")]
-    ErrorInstalingRuntimeInspector { err: tokio_tungstenite::tungstenite::Error },
+    #[error("Error during chrome setup")]
+    ErrorDuringChromeSetup,
 }
 
 pub enum ConsoleCallType {
@@ -122,6 +113,25 @@ pub enum ChromeDebuggerEvent {
     DebuggerResult(String),
     DebuggerParsingError(String, serde_json::Error),
     DebuggerSocketError(tokio_tungstenite::tungstenite::Error),
+    DebuggerAttached{
+        target_id:            String,
+        session_id:           String,
+        target_type:          String,
+        waiting_for_debugger: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct IdCounter(std::sync::Arc<std::sync::atomic::AtomicI64>);
+
+impl IdCounter {
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)))
+    }
+
+    pub fn next(&self) -> i64 {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 // event handler must be async
@@ -150,15 +160,46 @@ impl ChromeUnderControl {
         // Construct the command to launch chrome
         let mut cmd = Self::constuct_launch_command(chrome_path, chrome_log_path, logging_prefix, &about_blank_url, debug_port, chrome_logging);
 
-        let proc_handle = cmd.spawn().map_err(ChromeLaunchError::ChromeProcessLaunchError)?;
+        let mut proc_handle = cmd.spawn().map_err(ChromeLaunchError::ChromeProcessLaunchError)?;
 
         // Wait for chrome to start so that users can immediately start using it
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-        // Get all chrome information
-        let chrome_version_info = get_chrome_version(debug_port)
-            .await
-            .map_err(|e| ChromeLaunchError::ChromeVersionError { err: e })?;
+        // Check again if the process is still running
+        match proc_handle.try_wait() {
+            Ok(Some(status)) => {
+                print_red(&format!("Chrome process exited with status: {:?}", status));
+                return Err(ChromeLaunchError::ErrorDuringChromeSetup);
+            }
+            Ok(None) => {
+                print_blue("Chrome process is running");
+            }
+            Err(e) => {
+                print_red(&format!("Error checking if chrome process is running: {}", e));
+                return Err(ChromeLaunchError::ErrorDuringChromeSetup);
+            }
+        }
+
+        // Get the chrome version info... allow for some retries
+        let mut chrome_version_info: Option<ChromeVersion> = None;
+
+        // Retry getting chrome version 5 times
+        for attempt_index in 0..5 {
+            match get_chrome_version(debug_port).await {
+                Ok(version) => {
+                    chrome_version_info = Some(version);
+                    break;
+                }
+                Err(e) => {
+                    print_yellow(&format!("Error getting chrome version: {}", e));
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    if attempt_index == 4 {
+                        return Err(ChromeLaunchError::ChromeVersionError { err: e });
+                    }
+                }
+            }
+        }
+        let chrome_version_info = chrome_version_info.unwrap();
 
         print_blue(&format!("CHROME INFO:\n{:?}", chrome_version_info.browser));
 
@@ -169,15 +210,13 @@ impl ChromeUnderControl {
 
         print_blue(&format!("PAGES:\n{:?}", pages));
 
-        if pages.len() != 1 {
-            return Err(ChromeLaunchError::InvalidNumberOfPagesAtLaunch { page_count: pages.len() });
-        }
+        // Find the "about:blank" page
+        let pages = pages.into_iter().filter(|page| page.url == about_blank_url).collect::<Vec<_>>();
 
-        // Check that the page is the blank page
-        if pages[0].url != about_blank_url {
-            return Err(ChromeLaunchError::InvalidStartPageUrl {
-                url: pages[0].url.to_owned(),
-            });
+        // Checkt that there is 1 about:blank page
+        if pages.len() != 1 {
+            print_red(&format!("Invalid number of pages: {}", pages.len()));
+            return Err(ChromeLaunchError::ErrorDuringChromeSetup);
         }
 
         // Connect to the chrome debugger at that page
@@ -187,13 +226,81 @@ impl ChromeUnderControl {
                 stream
             }
             Err(e) => {
-                return Err(ChromeLaunchError::ErrorConnectingToTheDebugger { err: e });
+                print_red(&format!("Error connecting to chrome debugger: {}", e));
+                return Err(ChromeLaunchError::ErrorDuringChromeSetup);
             }
         };
 
+        // Create the sender and receiver for the websocket
         let (mut sender, mut receiver) = stream.split();
 
-        // Spawn a task to see mesages which are received from Chrome
+        // Create a channel for sending events. This needs to be done because some events need to be sent from other tasks.
+        let (event_sender_tx, mut event_sender_rx) = tokio::sync::mpsc::channel::<tokio_tungstenite::tungstenite::Message>(16);
+
+        // Create a task which just sends events to the websocket
+        tokio::spawn(async move {
+            while let Some(event) = event_sender_rx.recv().await {
+                match sender.send(event).await {
+                    Ok(_) => {
+                        print_blue("Event sent to websocket");
+                    }
+                    Err(e) => {
+                        print_red(&format!("Error sending event to websocket: {}", e));
+                    }
+
+                }
+            }
+        });
+
+        let id_counter = IdCounter::new();
+
+        // Enable runtime logging
+        let enable_runtime_message = format!("{{\"id\":{},\"method\":\"Runtime.enable\"}}", id_counter.next());
+        print_blue(&format!("Sending enable runtime message: {}", enable_runtime_message));
+        event_sender_tx
+            .send(tokio_tungstenite::tungstenite::Message::Text(enable_runtime_message))
+            .await
+            .map_err(|_| ChromeLaunchError::ErrorDuringChromeSetup)?;
+
+        // Enable debugger
+        let enable_debugger_message = format!("{{\"id\":{},\"method\":\"Debugger.enable\"}}", id_counter.next());
+        print_blue(&format!("Sending enable debugger message: {}", enable_debugger_message));
+        event_sender_tx
+            .send(tokio_tungstenite::tungstenite::Message::Text(enable_debugger_message))
+            .await
+            .map_err(|_| ChromeLaunchError::ErrorDuringChromeSetup)?;
+
+        // Enable inspector
+        let enable_inspector_message = format!("{{\"id\":{},\"method\":\"Inspector.enable\"}}", id_counter.next());
+        print_blue(&format!("Sending enable inspector message: {}", enable_inspector_message));
+        event_sender_tx
+            .send(tokio_tungstenite::tungstenite::Message::Text(enable_inspector_message))
+            .await
+            .map_err(|_| ChromeLaunchError::ErrorDuringChromeSetup)?;
+
+        // Set auto attach to true
+        let auto_attach_message = format!(
+            "{{\"id\":{},\"method\":\"Target.setAutoAttach\",\"params\":{{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":true}}}}",
+            id_counter.next()
+        );
+        print_blue(&format!("Sending auto attach message: {}", auto_attach_message));
+        event_sender_tx
+            .send(tokio_tungstenite::tungstenite::Message::Text(auto_attach_message))
+            .await
+            .map_err(|_| ChromeLaunchError::ErrorDuringChromeSetup)?;
+
+        // Set runIfWaitingForDebugger to true
+        let run_if_waiting_for_debugger_message = format!("{{\"id\":{},\"method\":\"Runtime.runIfWaitingForDebugger\"}}", id_counter.next());
+        print_blue(&format!("Sending runIfWaitingForDebugger message: {}", run_if_waiting_for_debugger_message));
+        event_sender_tx
+            .send(tokio_tungstenite::tungstenite::Message::Text(run_if_waiting_for_debugger_message))
+            .await
+            .map_err(|_| ChromeLaunchError::ErrorDuringChromeSetup)?;
+
+        let event_sender_tx_clone = event_sender_tx.clone();
+        let id_counter_clone = id_counter.clone();
+
+        // Create the receiver which will emit deubgger events.
         tokio::spawn(async move {
             let mut f = event_handler;
             while let Some(msg) = receiver.next().await {
@@ -235,6 +342,67 @@ impl ChromeUnderControl {
                                         "Inspector.targetCrashed" => {
                                             f(ChromeDebuggerEvent::ChromeDebuggerCrashed(text_msg.to_owned())).await;
                                         }
+                                        "Target.attachedToTarget" => {
+                                             // This message is received when a worker is launched. We need to
+                                             // enable the runtime and debugger for the worker as well.
+
+                                            let target_attached_to_target_response =
+                                                serde_json::from_value::<crate::chrome_debug_api_response::TargetAttachedToTargetResponse>(response.params);
+
+                                            match target_attached_to_target_response {
+                                                Ok(target_attached_to_target_response) => {
+                                                    let target_id = target_attached_to_target_response.target_info.target_id;
+                                                    let session_id = target_attached_to_target_response.session_id;
+
+                                                    let enable_runtime_message = format!(
+                                                        "{{\"id\":{}, \"sessionId\": \"{}\", \"method\":\"Runtime.enable\"}}",
+                                                        id_counter_clone.next(),
+                                                        session_id
+                                                    );
+                                                    print_blue(&format!("Sending enable runtime message: {}", enable_runtime_message));
+                                                    let _ = event_sender_tx_clone
+                                                        .send(tokio_tungstenite::tungstenite::Message::Text(enable_runtime_message))
+                                                        .await;
+
+                                                    // Enable debugger
+                                                    let enable_debugger_message = format!(
+                                                        "{{\"id\":{}, \"sessionId\": \"{}\", \"method\":\"Debugger.enable\"}}",
+                                                        id_counter_clone.next(),
+                                                        session_id
+                                                    );
+                                                    print_blue(&format!("Sending enable debugger message: {}", enable_debugger_message));
+                                                    let _ = event_sender_tx_clone
+                                                        .send(tokio_tungstenite::tungstenite::Message::Text(enable_debugger_message))
+                                                        .await;
+
+                                                    // Skip sending `Inspector.enable` message because chrome complains with the following message:
+                                                    // "'Inspector.enable' wasn't found"
+                                                    // This happens only when the `sessionId` is sent. If the `sessionId` is not sent, the message is accepted.
+                                                    // but this message is already sent on startup.
+
+                                                    // Now continue running the worker
+                                                    let continue_running_message = format!(
+                                                        "{{\"id\":{}, \"sessionId\": \"{}\", \"method\":\"Runtime.runIfWaitingForDebugger\"}}",
+                                                        id_counter_clone.next(),
+                                                        session_id
+                                                    );
+
+                                                    let _ = event_sender_tx_clone
+                                                        .send(tokio_tungstenite::tungstenite::Message::Text(continue_running_message))
+                                                        .await;
+
+                                                    f(ChromeDebuggerEvent::DebuggerAttached {
+                                                        target_id,
+                                                        session_id,
+                                                        target_type: target_attached_to_target_response.target_info.title,
+                                                        waiting_for_debugger: target_attached_to_target_response.waiting_for_debugger,
+                                                    }).await;
+                                                }
+                                                Err(e) => {
+                                                    f(ChromeDebuggerEvent::DebuggerParsingError(text_msg.to_owned(), e)).await;
+                                                }
+                                            }
+                                        }
                                         _ => {
                                             f(ChromeDebuggerEvent::OtherTextMessage(text_msg.to_owned())).await;
                                         }
@@ -255,32 +423,16 @@ impl ChromeUnderControl {
             }
         });
 
-        // Enable runtime logging
-        let enable_runtime_message = "{\"id\":1,\"method\":\"Runtime.enable\"}";
-        print_blue(&format!("Sending enable runtime message: {}", enable_runtime_message));
-        sender
-            .send(tokio_tungstenite::tungstenite::Message::Text(enable_runtime_message.into()))
-            .await
-            .map_err(|e| ChromeLaunchError::ErrorInstalingRuntimeInspector { err: e })?;
-
-        let enable_inspector_message = "{\"id\":2,\"method\":\"Inspector.enable\"}";
-        print_blue(&format!("Sending enable inspector message: {}", enable_inspector_message));
-        sender
-            .send(tokio_tungstenite::tungstenite::Message::Text(enable_inspector_message.into()))
-            .await
-            .map_err(|e| ChromeLaunchError::ErrorInstalingRuntimeInspector { err: e })?;
-
         Ok(Self {
             port,
             proc_handle,
-            stream_sender: sender,
-            websocket_id: 3, // 1 and 2 are used for navigation and inspection
+            stream_sender: event_sender_tx,
+            id_counter
         })
     }
 
-    fn advance_websocket_id(&mut self) -> u32 {
-        self.websocket_id += 1;
-        self.websocket_id
+    fn advance_websocket_id(&mut self) -> i64 {
+        self.id_counter.next()
     }
 
     pub async fn navigate_to(&mut self, url: &str) -> Result<(), ChromeError> {
@@ -334,7 +486,6 @@ impl ChromeUnderControl {
         cmd.arg(format!("--remote-debugging-port={}", debug_port));
         cmd.arg("--use-gl=swiftshader");
         cmd.arg("--renderer-process-limit=1");
-        cmd.arg("--single-process");
         cmd.arg("--no-zygote");
         cmd.arg("--disable-shared-workers");
 

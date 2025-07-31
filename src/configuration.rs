@@ -2,7 +2,7 @@ use std::{env, path::PathBuf};
 
 use clap::Parser;
 
-use crate::printer::print_yellow;
+use crate::printer::{print_red, print_yellow};
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -34,6 +34,9 @@ pub struct Opts {
     #[arg(long = "launch-timeout", help = "Timeout for running the launched browser task.")]
     lauch_timeout: Option<u32>,
 
+    #[arg(long = "silence-timeout", help = "Timeout (in seconds) since the last log output of the running WASM process")]
+    silence_timeout: Option<u32>,
+
     #[arg(
         long = "launch-debug-port",
         default_value = "9222",
@@ -52,13 +55,22 @@ pub struct Opts {
 
     #[arg(
         long = "allowed-chrome-crashes",
-        default_value = "1",
+        default_value = "3",
         help = "Number of Chrome crashes to allow before exiting"
     )]
     allowed_chrome_crashes: u32,
 
     #[arg(help = "Arguments to pass to Chrome")]
     url_args: Option<Vec<String>>,
+
+    #[arg(long = "hostname", default_value = "localhost", help = "Hostname to use for serving")]
+    hostname: String,
+
+    #[arg(long = "strict-port", help = "Only use assigned ports and do not try to find a free one.")]
+    strict_port: bool,
+
+    #[arg(long = "pageload-timeout", default_value = "20", help = "Timeout for page load. Only used when --launch-chrome is enabled.")]
+    pageload_timeout: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -69,13 +81,26 @@ pub enum BuildType {
     Debug,
 }
 
+fn dir_from_build_type(&build_type: &BuildType) -> Option<&'static str> {
+    match build_type {
+        BuildType::Raw        => None,
+        BuildType::Release    => Some("Release"   ),
+        BuildType::DevRelease => Some("DevRelease"),
+        BuildType::Debug      => Some("Debug"     ),
+    }
+}
+
+
 pub struct ValidatedOpts {
     pub build_type:             BuildType,
     pub root_path:              PathBuf,
+    pub full_serve_path:        PathBuf,
     pub port:                   u16,
     pub cross_origin:           bool,
     pub launch_chrome:          bool,
     pub lauch_timeout:          Option<u32>,
+    pub pageload_timeout:       u32,
+    pub silence_timeout:        Option<u32>,
     pub launch_debug_port:      u16,
     pub wait_after_error:       u32,
     pub full_url_arg:           Option<String>,
@@ -84,6 +109,8 @@ pub struct ValidatedOpts {
     pub chrome_logging_prefix:  String,
     pub allowed_chrome_crashes: u32,
     pub chrome_logging:         bool,
+    pub hostname:               String,
+    pub strict_port:            bool,
 }
 
 fn validate_opts(opts: Opts) -> ValidatedOpts {
@@ -98,23 +125,45 @@ fn validate_opts(opts: Opts) -> ValidatedOpts {
         ),
     };
 
+    let root_prefix = dir_from_build_type(&build_type);
+
     let root_path = match opts.input {
         Some(path) => path,
         None => std::env::current_dir().unwrap(),
     };
 
+    let full_serve_path = match root_prefix {
+        Some(prefix) => root_path.join(prefix),
+        None => root_path.clone(),
+    };
+
     let mut full_url_arg = None;
 
-    if let Some(url_args) = opts.url_args {
+    if let Some(mut url_args) = opts.url_args {
+
+        if let Some(ref mut first_element) = url_args.first_mut() {
+            // If the user forgot to add .html to the URL, we'll add it for them
+            if !first_element.ends_with(".html") {
+                first_element.push_str(".html")
+            }
+
+            // Check immediately if the first argument is an existing file
+            let full_path = full_serve_path.join(first_element);
+            if !full_path.exists() {
+                print_red(&format!("FILE NOT FOUND: {}", full_path.to_string_lossy()));
+                panic!();
+            }
+        }
+
         let mut url_args = url_args.into_iter().peekable();
 
         if let Some(url) = url_args.next() {
             let mut full_url = url;
 
-            let possible_prefix = format!("http://localhost:{}/", opts.port);
+            let possible_prefix = format!("http://{}:{}/", &opts.hostname, opts.port);
 
             if full_url.starts_with(&possible_prefix) {
-                print_yellow(&format!("No need to http://localhost:{}/ prefix", opts.port));
+                print_yellow(&format!("No need to http://{}:{}/ prefix", &opts.hostname, opts.port));
                 full_url = full_url.replacen(&possible_prefix, "", 1);
             }
 
@@ -133,7 +182,8 @@ fn validate_opts(opts: Opts) -> ValidatedOpts {
     }
 
     if opts.launch_chrome && full_url_arg.is_none() {
-        panic!("--launch-chrome requires a URL argument");
+        print_red("NO URL ARGUMENT FOR --launch-chrome");
+        panic!();
     }
 
     let full_chrome_path = match opts.chrome_path {
@@ -159,7 +209,7 @@ fn validate_opts(opts: Opts) -> ValidatedOpts {
         true => true,
         false => match env::var("POSLUZNIK_CHROME_LOGGING") {
             Ok(val) => match val.as_str() {
-                "1" | "true" | "True" | "TRUE" => true,
+                "1" | "true"  | "True"  | "TRUE"  => true,
                 "0" | "false" | "False" | "FALSE" => false,
                 _ => {
                     panic!("Invalid value for POSLUZNIK_CHROME_LOGGING: {}", val);
@@ -183,9 +233,12 @@ fn validate_opts(opts: Opts) -> ValidatedOpts {
         build_type,
         port: opts.port,
         root_path,
+        full_serve_path: full_serve_path.to_path_buf(),
         cross_origin: opts.cross_origin,
         launch_chrome: opts.launch_chrome,
         lauch_timeout: opts.lauch_timeout,
+        pageload_timeout: opts.pageload_timeout,
+        silence_timeout: opts.silence_timeout,
         launch_debug_port: opts.launch_debug_port,
         wait_after_error: opts.wait_after_error,
         full_url_arg,
@@ -194,6 +247,8 @@ fn validate_opts(opts: Opts) -> ValidatedOpts {
         chrome_logging_prefix,
         allowed_chrome_crashes: opts.allowed_chrome_crashes,
         chrome_logging,
+        hostname: opts.hostname,
+        strict_port: opts.strict_port,
     }
 }
 
