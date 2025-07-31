@@ -2,8 +2,9 @@ mod chrome_control;
 mod chrome_debug_api_response;
 mod configuration;
 mod printer;
+mod stdio_html_request_parser;
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::{SocketAddr, IpAddr}, path::PathBuf};
 
 use axum::{
     body::{Bytes, Full},
@@ -14,6 +15,7 @@ use axum::{
 };
 
 use printer::{print_blue, print_red};
+use stdio_html_request_parser::{parse_request, StdioParsingOptions, StdioRequest, StdioRequestParseError};
 
 use crate::{
     chrome_control::{ChromeDebuggerEvent, ChromeUnderControl, ConsoleCallType},
@@ -21,61 +23,53 @@ use crate::{
 };
 
 async fn post_stdio(State(app_state): State<AppState>, request: Bytes) {
-    if request.starts_with(b"^out^") {
-        if app_state.stdio_logging {
-            let parts = request.split(|b| *b == b'^').collect::<Vec<_>>();
-            if parts.len() < 4 {
-                print_yellow(&format!("INVALID STDIO.HTML REQUEST: {:?}", request));
-                return;
+
+    let parse_options = StdioParsingOptions {
+        parse_stdio_output: app_state.stdio_logging,
+    };
+
+    match parse_request(&parse_options, &request) {
+        Ok(parsed) => match parsed {
+            StdioRequest::ConsoleOutput(out) => {
+                println!("{}", out);
+                let _ = app_state.silence_tx.send(tokio::time::Instant::now()).await;
             }
-
-            let out = percent_encoding::percent_decode(parts[3]).decode_utf8_lossy();
-
-            println!("{}", out);
-        }
-    } else if request.starts_with(b"^err^") {
-        if app_state.stdio_logging {
-            let parts = request.split(|b| *b == b'^').collect::<Vec<_>>();
-            if parts.len() < 4 {
-                print_yellow(&format!("INVALID STDIO.HTML REQUEST: {:?}", request));
-                return;
+            StdioRequest::ConsoleError(err) => {
+                print_red(&err);
+                let _ = app_state.silence_tx.send(tokio::time::Instant::now()).await;
             }
-
-            let err = percent_encoding::percent_decode(parts[3]).decode_utf8_lossy();
-
-            print_red(&err);
+            StdioRequest::IgnoredRequest => {},
+            StdioRequest::ExitRequest => {
+                print_blue("EXIT RECEIVED");
+                if app_state.launch_chrome {
+                    let _ = app_state.shutdown_tx.send(ShutdownEvent::ExitRequest).await;
+                }
+            }
+            StdioRequest::PageLoad => {
+                print_blue("PAGE LOAD RECEIVED");
+                if app_state.launch_chrome {
+                    // Only send the page load event if chrome is launched
+                    // Otherwise nobody will empty the channel and the server will hang
+                    let _ = app_state.pageload_tx.send(()).await;
+                }
+            }
         }
-    } else if request.starts_with(b"^exit^") {
-        print_blue("EXIT RECEIVED");
-        if app_state.launch_chrome {
-            let _ = app_state.shutdown_tx.send(ShutdownEvent::ExitRequest).await;
+        Err(err) => match err {
+            StdioRequestParseError::UnknownRequest(err) => {
+                print_blue(&format!("GOT STDIO.HTML REQUEST: {}", err));
+            }
+            StdioRequestParseError::InvalidRequest(err) => {
+                print_yellow(&format!("INVALID STDIO.HTML REQUEST: {}", err));
+            }
         }
-    } else {
-        print_blue(&format!("GOT STDIO.HTML REQUEST: {:?}", request));
     }
 }
 
-fn dir_from_build_type(&build_type: &configuration::BuildType) -> Option<&'static str> {
-    match build_type {
-        configuration::BuildType::Raw => None,
-        configuration::BuildType::Release => Some("Release"),
-        configuration::BuildType::DevRelease => Some("DevRelease"),
-        configuration::BuildType::Debug => Some("Debug"),
-    }
-}
 
 async fn general_serve(Path(p): Path<String>, State(app_state): State<AppState>) -> Response<Full<Bytes>> {
     print_blue(&format!("GET_REQUEST: {}", p));
 
-    let prefix = dir_from_build_type(&app_state.build_type);
-
-    // determine the directory to serve from
-    let dir = match prefix {
-        Some(prefix) => std::path::Path::join(&app_state.serve_root, prefix),
-        None => app_state.serve_root.clone(),
-    };
-
-    let file_candidate = std::path::Path::join(&dir, &p);
+    let file_candidate = std::path::Path::join(&app_state.full_serve_path, &p);
 
     if file_candidate.is_file() {
         print_blue(&format!("FOUND_FILE: {:?}", file_candidate));
@@ -116,27 +110,27 @@ async fn general_serve(Path(p): Path<String>, State(app_state): State<AppState>)
 
 #[derive(Debug, Clone)]
 struct AppState {
-    pub serve_root:    PathBuf,
-    pub build_type:    configuration::BuildType,
-    pub cross_origin:  bool,
-    pub launch_chrome: bool,
-    pub shutdown_tx:   tokio::sync::mpsc::Sender<ShutdownEvent>,
-    pub stdio_logging: bool,
+    pub full_serve_path: PathBuf,
+    pub cross_origin:    bool,
+    pub launch_chrome:   bool,
+    pub shutdown_tx:     tokio::sync::mpsc::Sender<ShutdownEvent>,
+    pub stdio_logging:   bool,
+    pub pageload_tx:     tokio::sync::mpsc::Sender<()>,
+    pub silence_tx:      tokio::sync::mpsc::Sender<tokio::time::Instant>,
 }
 
 fn print_all_html_file_links_for_user_comfort(args: &configuration::ValidatedOpts) {
-    // determine the directory to serve from
-    let prefix = dir_from_build_type(&args.build_type);
-
-    let full_serve_path = match prefix {
-        Some(prefix) => std::path::Path::join(&args.root_path, prefix),
-        None => args.root_path.clone(),
-    };
-
-    println!("Serving from : {}", full_serve_path.to_string_lossy());
+    println!("Serving from : {}"  , args.full_serve_path.display());
     println!("  Build type : {:?}", args.build_type);
     println!("Cross origin : {:?}", args.cross_origin);
+    println!("    hostname : {}"  , args.hostname);
+    println!("        port : {}"  , args.port);
     println!();
+
+    if let Some(full_url) = &args.full_url_arg {
+        println!("Full URL: http://{}:{}/{}", &args.hostname, args.port, full_url);
+        println!();
+    }
 
     if args.launch_chrome {
         println!("Chrome will be launched with the following arguments:");
@@ -150,16 +144,16 @@ fn print_all_html_file_links_for_user_comfort(args: &configuration::ValidatedOpt
 
     println!("You can open the following links in your browser:");
 
-    for entry in std::fs::read_dir(&full_serve_path).unwrap() {
+    for entry in std::fs::read_dir(&args.full_serve_path).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
 
         if path.is_file() {
-            let path = path.strip_prefix(&full_serve_path).unwrap();
+            let path = path.strip_prefix(&args.full_serve_path).unwrap();
             let path = path.to_str().unwrap_or_default();
 
             if path.ends_with(".html") {
-                println!("http://localhost:{}/{}", args.port, path);
+                println!("http://{}:{}/{}", &args.hostname, args.port, path);
             }
         }
     }
@@ -167,11 +161,9 @@ fn print_all_html_file_links_for_user_comfort(args: &configuration::ValidatedOpt
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), ()> {
-    let args = configuration::get_opts();
+    let mut args = configuration::get_opts();
 
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
-
-    print_all_html_file_links_for_user_comfort(&args);
 
     for run_attempt_index in 0..(args.allowed_chrome_crashes + 1u32) {
         match single_run_main(&args).await {
@@ -181,57 +173,144 @@ async fn main() -> Result<(), ()> {
             }
             Ok(ShutdownEvent::ChromeCrash) => {
                 print_red("CHROME INTERNAL CRASH");
-                if run_attempt_index + 1 < args.allowed_chrome_crashes {
-                    print_blue(&format!("RESTARTING CHROME (ATTEMPT {})", run_attempt_index + 2));
+                if run_attempt_index < args.allowed_chrome_crashes {
+                    print_blue(&format!("RESTARTING CHROME (ATTEMPT {})", run_attempt_index + 1));
                 }
             }
             Ok(ShutdownEvent::TestFailure) => {
                 print_red("TEST FAILURE");
                 return Err(());
             }
-            Ok(ShutdownEvent::LaunchTimeout) => {
-                print_yellow("LAUNCH TIMEOUT");
+            Ok(ShutdownEvent::ProcessTimeout) => {
+                print_yellow("PROCESS TIMEOUT");
+                return Err(());
+            }
+            Ok(ShutdownEvent::SilenceTimeout) => {
+                print_yellow("SILENCE TIMEOUT");
                 return Err(());
             }
             Ok(ShutdownEvent::UserCancel) => {
                 print_yellow("USER CANCEL");
                 return Err(());
             }
+            Ok(ShutdownEvent::PortInUse) => {
+                print_yellow("PORT IN USE");
+                if args.strict_port {
+                    print_red("STRICT PORT MODE ENABLED: EXITING");
+                    return Err(());
+                }
+                else if run_attempt_index < args.allowed_chrome_crashes {
+                    print_blue(&format!("RESTARTING SERVER (ATTEMPT {})", run_attempt_index + 1));
+                    args.port = args.port.saturating_sub(rand::random::<u16>() % 16 + 1);
+                }
+            }
+            Ok(ShutdownEvent::DebugPortInUse) => {
+                print_yellow("DEBUG PORT IN USE");
+                if args.strict_port {
+                    print_red("STRICT PORT MODE ENABLED: EXITING");
+                    return Err(());
+                }
+                else if run_attempt_index < args.allowed_chrome_crashes {
+                    print_blue(&format!("RESTARTING SERVER (ATTEMPT {})", run_attempt_index + 1));
+                    // Also try to change the port in case the original cause of the issue is some other
+                    // process interfering with the port.
+                    tokio::time::sleep(tokio::time::Duration::from_secs(args.wait_after_error.into())).await;
+                    args.launch_debug_port = args.launch_debug_port.saturating_sub(rand::random::<u16>() % 32 + 3);
+                }
+            }
+            Ok(ShutdownEvent::VersionError(e)) => {
+                print_yellow(&format!("CHROME VERSION ERROR: {:?}", e));
+                if args.strict_port {
+                    print_red("STRICT PORT MODE ENABLED: EXITING");
+                    return Err(());
+                }
+                else if run_attempt_index < args.allowed_chrome_crashes {
+                    print_blue(&format!("RESTARTING CHROME (ATTEMPT {})", run_attempt_index + 1));
+                    // Also try to change the port in case the original cause of the issue is some other
+                    // process interfering with the port.
+                    tokio::time::sleep(tokio::time::Duration::from_secs(args.wait_after_error.into())).await;
+                    args.launch_debug_port = args.launch_debug_port.saturating_sub(rand::random::<u16>() % 32 + 3);
+                }
+            }
+            Ok(ShutdownEvent::PageLoadTimeout) => {
+                print_yellow("PAGE LOAD TIMEOUT");
+                if run_attempt_index < args.allowed_chrome_crashes {
+                    print_blue(&format!("RESTARTING CHROME (ATTEMPT {})", run_attempt_index + 1));
+                    if !args.strict_port {
+                        // Also try to change the port in case the original cause of the issue is some other
+                        // process interfering with the port.
+                        args.port = args.port.saturating_sub(rand::random::<u16>() % 32 + 1);
+                        args.launch_debug_port = args.launch_debug_port.saturating_sub(rand::random::<u16>() % 32 + 1);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(args.wait_after_error.into())).await;
+                }
+            }
             Err(()) => {
-                print_red("MEASUREMENT FAILURE");
+                print_red("UNRECOVERABLE SINGLE RUN FAILURE");
                 return Err(());
             }
         }
     }
 
-    print_yellow("TOO MANY CHROME CRASHES");
+    print_red("TOO MANY CHROME CRASHES");
     Err(())
 }
 
-#[derive(Copy, Clone, Debug)]
+async fn http_server_soft_close<T>(handle: & tokio::task::JoinHandle<Result<(), T>>) {
+    // Stop the server
+    handle.abort();
+
+    // Wait in order to give the server time to shut down.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+}
+
+#[derive(Clone, Debug)]
 enum ShutdownEvent {
     ExitRequest,
     UserCancel,
     ChromeCrash,
     TestFailure,
-    LaunchTimeout,
+    ProcessTimeout,
+    SilenceTimeout,
+    PageLoadTimeout,
+    PortInUse,
+    DebugPortInUse,
+    VersionError(String),
 }
 
 async fn single_run_main(args: &configuration::ValidatedOpts) -> Result<ShutdownEvent, ()> {
+    print_all_html_file_links_for_user_comfort(args);
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<ShutdownEvent>(8);
+    let (silence_tx , mut silence_rx ) = tokio::sync::mpsc::channel::<tokio::time::Instant>(32);
+    let (pageload_tx, mut pageload_rx) = tokio::sync::mpsc::channel::<()>(8);
 
     let app_state = AppState {
-        serve_root:    args.root_path.clone(),
-        build_type:    args.build_type,
-        cross_origin:  args.cross_origin,
-        launch_chrome: args.launch_chrome,
-        shutdown_tx:   shutdown_tx.clone(),
-        stdio_logging: !args.launch_chrome,
+        full_serve_path: args.full_serve_path.clone(),
+        cross_origin:    args.cross_origin,
+        launch_chrome:   args.launch_chrome,
+        shutdown_tx:     shutdown_tx.clone(),
+        stdio_logging:   !args.launch_chrome,
+        pageload_tx:     pageload_tx.clone(),
+        silence_tx:      silence_tx.clone(),
     };
 
     let mut chrome: Option<chrome_control::ChromeUnderControl> = None;
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
+    let ip_addr = match &args.hostname[..] {
+        "localhost" => IpAddr::from([127, 0, 0, 1]),
+        others => {
+            match others.parse::<std::net::IpAddr>() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    print_red(&format!("Invalid hostname: {:?}\n{:?}", args.hostname, e));
+                    return Err(());
+                }
+            }
+        }
+    };
+
+    let addr = SocketAddr::from((ip_addr, args.port));
 
     let server_task = tokio::spawn(async move {
         let app = Router::new()
@@ -248,8 +327,53 @@ async fn single_run_main(args: &configuration::ValidatedOpts) -> Result<Shutdown
             .with_state(app_state)
             .into_make_service();
 
-        axum::Server::bind(&addr).serve(app).await
+        axum::Server::try_bind(&addr)?
+            .serve(app)
+            .await
     });
+
+    // Wait in order to give the server time to start.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    if server_task.is_finished() {
+        print_red("SERVER FAILED TO START");
+        match server_task.await {
+            Ok(Ok(_)) => {
+                print_red("SERVER TASK FAILD SUCCESSFULLY ?!");
+                return Err(());
+            },
+            Ok(Err(e)) => {
+                print_red(&format!("SERVER ERROR: {:?}", e));
+                return Ok(ShutdownEvent::PortInUse);
+            },
+            Err(e) => {
+                print_red(&format!("SERVER TASK ERROR: {:?}", e));
+                return Err(());
+            }
+        }
+    }
+
+    if args.launch_chrome {
+        // Only monitor pageloads when chrome is launched
+
+        let pageload_shutdnow_tx = shutdown_tx.clone();
+        let pageload_duration = args.pageload_timeout;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = pageload_rx.recv() => {
+                    print_blue("PAGE LOAD RX RECEIVED");
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_secs(pageload_duration as u64)) => {
+                    print_red("PAGE LOAD TIMEOUT EXPIRED");
+                    let _ = pageload_shutdnow_tx.send(ShutdownEvent::PageLoadTimeout).await;
+                }
+            }
+            // Keep clearing the channel while the task is running.
+            // This might be necessary because someone might be manually opening
+            // the page in the browser and we don't want to fill up the channel.
+            while (pageload_rx.recv().await).is_some() {}
+        });
+    }
 
     let shutdown_task = tokio::spawn(async move {
         let event = shutdown_rx.recv().await;
@@ -271,21 +395,25 @@ async fn single_run_main(args: &configuration::ValidatedOpts) -> Result<Shutdown
             args.chrome_logging,
             move |event| {
                 let sender = shutdown_from_event_handler.clone();
+                let silence_tx = silence_tx.clone();
                 async move {
                     match event {
-                        ChromeDebuggerEvent::ConsoleAPICalled { msg, message_type } => match message_type {
-                            ConsoleCallType::Error => {
-                                print_red(&msg);
+                        ChromeDebuggerEvent::ConsoleAPICalled { msg, message_type } => {
+                            match message_type {
+                                ConsoleCallType::Error => {
+                                    print_red(&msg);
+                                }
+                                ConsoleCallType::Warning => {
+                                    print_yellow(&msg);
+                                }
+                                ConsoleCallType::Info | ConsoleCallType::Debug | ConsoleCallType::Other => {
+                                    print_blue(&msg);
+                                }
+                                ConsoleCallType::Log => {
+                                    println!("{}", msg);
+                                }
                             }
-                            ConsoleCallType::Warning => {
-                                print_yellow(&msg);
-                            }
-                            ConsoleCallType::Info | ConsoleCallType::Debug | ConsoleCallType::Other => {
-                                print_blue(&msg);
-                            }
-                            ConsoleCallType::Log => {
-                                println!("{}", msg);
-                            }
+                            let _ = silence_tx.send(tokio::time::Instant::now()).await;
                         },
                         ChromeDebuggerEvent::ExceptionThrown(msg) => {
                             print_red(&format!("EXCEPTION THROWN:\n{}", msg));
@@ -310,6 +438,13 @@ async fn single_run_main(args: &configuration::ValidatedOpts) -> Result<Shutdown
                         ChromeDebuggerEvent::DebuggerSocketError(e) => {
                             print_red(&format!("DEBUGGER SOCKET ERROR: {:?}", e));
                         }
+                        ChromeDebuggerEvent::DebuggerAttached { target_id, session_id, target_type, waiting_for_debugger } => {
+                            print_blue("DEBUGGER ATTACHED:");
+                            print_blue(&format!("    TARGET_ID : {}", target_id));
+                            print_blue(&format!("   SESSION_ID : {}", session_id));
+                            print_blue(&format!("  TARGET_TYPE : {}", target_type));
+                            print_blue(&format!("      WAITING : {}", waiting_for_debugger));
+                        }
                     }
                 }
             },
@@ -329,6 +464,24 @@ async fn single_run_main(args: &configuration::ValidatedOpts) -> Result<Shutdown
             }
             Err(e) => {
                 print_red(&format!("CHROME LAUNCH ERROR: {:?}", e));
+
+                // Early https server abort to free up the port
+                http_server_soft_close(&server_task).await;
+
+                // Return the error. The top level function will decidet what to do with it.
+                match e {
+                    chrome_control::ChromeLaunchError::ChromeAlreadyRunningError { debug_port: _ } => {
+                        return Ok(ShutdownEvent::DebugPortInUse);
+                    },
+                    chrome_control::ChromeLaunchError::ChromeVersionError { err } => {
+                        // A chrome launch error is also related to a debug port in use by another chrome instance.
+                        // Returning an `Ok(_)` value in order to trigger another chrome launch attempt.
+                        return Ok(ShutdownEvent::VersionError(err.to_string()));
+                    },
+                    _ => {
+                        return Err(());
+                    }
+                }
             }
         }
 
@@ -345,22 +498,54 @@ async fn single_run_main(args: &configuration::ValidatedOpts) -> Result<Shutdown
     }
 
     if let Some(launch_timeout) = args.lauch_timeout {
+        let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(launch_timeout as u64)).await;
-            print_red("LAUNCH TIMEOUT EXPIRED");
+            print_red("PROCESS TIMEOUT EXPIRED");
 
             // Ignore the send error if the channel is closed (which it will be if the server shuts down)
-            let _ = shutdown_tx.send(ShutdownEvent::LaunchTimeout).await;
+            let _ = shutdown_tx.send(ShutdownEvent::ProcessTimeout).await;
         });
+    }
+
+    if let Some(silence_timeout) = args.silence_timeout {
+        tokio::spawn(async move {
+            let mut last_non_silence = tokio::time::Instant::now();
+            loop {
+                tokio::select! {
+                    silence_broken = silence_rx.recv() => {
+                        if let Some( t ) = silence_broken {
+                            last_non_silence = t;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        // check if silence timeout is reached
+                        let current_time = tokio::time::Instant::now();
+                        let silence_time = current_time - last_non_silence;
+                        if silence_time > tokio::time::Duration::from_secs(silence_timeout as u64) {
+                            print_red("SILENCE TIMEOUT REACHED");
+
+                            // Ignore the send error if the channel is closed (which it will be if the server shuts down)
+                            let _ = shutdown_tx.send(ShutdownEvent::SilenceTimeout).await;
+
+                            // break the infinite loop and finish the task
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    } else {
+        drop(silence_rx);
     }
 
     let shutdown_event = shutdown_task.await;
 
     print_blue("DROPPING SERVER");
-    // Server is aborted in order to free up the port.
-    server_task.abort_handle().abort();
-    // Wait in oder to give the server time to shut down.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    http_server_soft_close(&server_task).await;
 
     print_blue("SHUTTING DOWN SERVER");
 

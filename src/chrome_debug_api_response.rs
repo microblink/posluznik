@@ -22,6 +22,24 @@ pub struct ConsoleAPICalledResponse {
     pub args:              Vec<serde_json::Value>,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetInfo {
+    pub target_id: String,
+    pub title:     String,
+    pub url:       String,
+    pub attached:  bool,
+
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetAttachedToTargetResponse {
+    pub session_id:           String,
+    pub target_info:          TargetInfo,
+    pub waiting_for_debugger: bool,
+}
+
 impl ConsoleAPICalledResponse {
     pub fn get_log_message(&self) -> String {
         let mut log_message = String::new();
