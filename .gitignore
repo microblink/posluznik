@@ -3,3 +3,7 @@
 .vscode
 .mypy_cache
 build
+
+bazel-*
+Session.vim
+MODULE.bazel.lock
