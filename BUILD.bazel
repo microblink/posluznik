@@ -1,0 +1,30 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@crates//:defs.bzl", "all_crate_deps")
+
+config_setting(
+    name = "release",
+    values = {
+        "compilation_mode": "opt",
+    },
+)
+
+rust_binary(
+    name = "posluznik",
+    srcs = glob(["src/**/*.rs"]),
+    deps = all_crate_deps(
+        normal = True,
+    ),
+    rustc_flags = select({
+       "//:release": [
+            "-Ccodegen-units=1",
+            "-Cpanic=abort",
+            "-Copt-level=s",
+            "-Cstrip=symbols",
+        ],
+        "//conditions:default": [
+           "-Copt-level=1",
+           "-Cdebuginfo=2",
+        ],
+    }),
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,27 @@
+module(
+    name = "posluznik",
+    version = "1.3.5",
+)
+
+bazel_dep(name = "rules_rust", version = "0.63.0")
+
+RUST_EDITION = "2021"
+RUST_VERSION = "1.89.0"
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = RUST_EDITION,
+    versions = [RUST_VERSION],
+)
+use_repo(rust, "rust_toolchains")
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
+#
+# External crates
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "crates")

@@ -1,0 +1,10 @@
+common --@rules_rust//rust/settings:extra_rustc_flag=-Copt-level=1
+common --@rules_rust//rust/settings:extra_rustc_flag=-Cdebuginfo=2
+
+common:release --compilation_mode=opt
+common:release --@rules_rust//rust/settings:lto=thin
+common:release --@rules_rust//rust/settings:extra_rustc_flag=-Copt-level=s
+common:release --@rules_rust//rust/settings:extra_rustc_flag=-Cdebuginfo=0
+common:release --@rules_rust//rust/settings:extra_rustc_flag=-Cpanic=abort
+common:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
+
