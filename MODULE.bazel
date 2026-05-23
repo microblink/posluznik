@@ -17,7 +17,25 @@ use_repo(rust, "rust_toolchains")
 register_toolchains("@rust_toolchains//:all")
 
 crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
-#
+
+bazel_dep(name = "openssl", version = "3.5.5.bcr.4")
+
+# workaround for injection of OpenSSl from BCR until [this PR lands to rules_rust](https://github.com/bazelbuild/rules_rust/pull/3755)
+OPENSSL_GEN_DIR = "@@openssl+//:gen_dir"
+
+crate.annotation(
+    crate = "openssl-sys",
+    build_script_data = [
+        OPENSSL_GEN_DIR,
+    ],
+    build_script_env = {
+        # Tell openssl-sys to use the Bazel-provided directory
+        "OPENSSL_DIR": "$(execpath {})".format(OPENSSL_GEN_DIR),
+        "OPENSSL_STATIC": "1",
+        "OPENSSL_NO_VENDOR": "1",
+    },
+)
+
 # External crates
 crate.from_cargo(
     name = "posluznik_crates",
@@ -25,3 +43,5 @@ crate.from_cargo(
     manifests = ["//:Cargo.toml"],
 )
 use_repo(crate, "posluznik_crates")
+
+
