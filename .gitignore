@@ -7,3 +7,4 @@ build
 bazel-*
 Session.vim
 MODULE.bazel.lock
+.tasks.json

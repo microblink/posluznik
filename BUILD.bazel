@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary")
-load("@crates//:defs.bzl", "all_crate_deps")
+load("@posluznik_crates//:defs.bzl", "all_crate_deps")
 
 config_setting(
     name = "release",

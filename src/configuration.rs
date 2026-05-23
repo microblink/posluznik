@@ -16,7 +16,11 @@ pub struct Opts {
     #[arg(short = 'D', help = "Serve from `Debug` directory.")]
     use_debug: bool,
 
-    #[arg(short = 'p', long = "port", default_value = "6931")]
+    #[arg(
+        short = 'p',
+        long = "port",
+        default_value_t = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    )]
     port: u16,
 
     #[arg(long = "input", help = "Path to the directory to serve. Defaults to the current directory.")]
@@ -39,7 +43,8 @@ pub struct Opts {
 
     #[arg(
         long = "launch-debug-port",
-        default_value = "9222",
+        // default_value = "9222",
+        default_value_t = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(),
         help = "Port to use for debugging the launched browser."
     )]
     launch_debug_port: u16,
